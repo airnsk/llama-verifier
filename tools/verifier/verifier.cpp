@@ -49,6 +49,7 @@
 #include <deque>
 #include <future>
 #include <mutex>
+#include <random>
 #include <signal.h>
 #include <string>
 #include <thread>
@@ -164,10 +165,18 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
 
     // ---------- разбор/валидация ----------
     const std::string mode = req.value("mode", std::string("greedy"));
-    if (mode != "greedy") { err = "mode=" + mode + " not implemented in v1"; return {}; }
-    if (req.contains("temperature") && req["temperature"].get<double>() != 0.0) {
-        err = "temperature>0 not implemented in v1"; return {};
+    if (mode != "greedy" && mode != "exact" && mode != "threshold") {
+        err = "mode must be greedy|exact|threshold"; return {};
     }
+    const bool sampled_mode = (mode != "greedy");
+    if (sampled_mode && (!req.contains("temperature") || !req["temperature"].is_number() || req["temperature"].get<double>() <= 0.0)) {
+        err = "mode=" + mode + " requires temperature > 0"; return {};
+    }
+    const double temp = sampled_mode ? req["temperature"].get<double>() : 0.0;
+    const double tau  = req.value("tau", 0.3);
+    if (mode == "threshold" && (tau <= 0.0 || tau >= 1.0)) { err = "tau must be in (0,1)"; return {}; }
+    const unsigned vseed = req.value("seed", (unsigned) std::chrono::steady_clock::now().time_since_epoch().count());
+    std::mt19937 rng(vseed);
     if (!req.contains("prefix_tokens") || !req["prefix_tokens"].is_array() || req["prefix_tokens"].empty()) {
         err = "prefix_tokens must be a non-empty array"; return {};
     }
@@ -193,15 +202,31 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
         if (!jc.is_object() || !jc.contains("tokens") || !jc["tokens"].is_array()) {
             err = "chains[i].tokens must be array"; return {};
         }
-        if (jc.contains("q")) { err = "q[] (exact) not implemented in v1"; return {}; }
+        if (jc.contains("q") && mode != "exact") { err = "q[] is only valid for mode=exact"; return {}; }
         for (const auto & t : jc["tokens"]) {
             if (!t.is_number_integer()) { err = "chain tokens must be integers"; return {}; }
             llama_token id = t.get<llama_token>();
             if (id < 0 || id >= v.n_vocab) { err = "chain token id out of vocab"; return {}; }
             chains[i].push_back(id);
         }
+        if (chains[i].empty()) { err = "chains[i].tokens must be non-empty"; return {}; }
         maxK = std::max(maxK, (int64_t) chains[i].size());
         sumK += (int64_t) chains[i].size();
+    }
+    std::vector<std::vector<double>> qs(n_chains);
+    if (mode == "exact") {
+        for (int i = 0; i < n_chains; i++) {
+            const auto & jc = req["chains"][i];
+            if (!jc.contains("q") || !jc["q"].is_array() || (int64_t) jc["q"].size() != (int64_t) chains[i].size()) {
+                err = "mode=exact requires chains[i].q with exactly K elements"; return {};
+            }
+            for (const auto & qv : jc["q"]) {
+                if (!qv.is_number()) { err = "q values must be numbers"; return {}; }
+                const double q = qv.get<double>();
+                if (!(q > 0.0) || q > 1.0) { err = "q values must be in (0,1]"; return {}; }
+                qs[i].push_back(q);
+            }
+        }
     }
     const int64_t L = (int64_t) prefix.size();
     if (L + std::max(maxK, (int64_t) 1) > (int64_t) llama_n_ctx(v.ctx)) {
@@ -236,6 +261,7 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
 
     // ---------- p0 / хвост префикса ----------
     // m == L: ствол == prefix. p0 или из кэша, или откат 1 токена + досчёт.
+    if (sampled_mode) v.p0_invalidate(); // кэш хранит только argmax — exact/threshold нужен полный дистрибутив p0
     if (m == L && !(v.p0_len == L && v.p0_top >= 0)) {
         bool ok = llama_memory_seq_rm(v.mem, 0, (llama_pos) (L - 1), -1);
         if (ok) {
@@ -248,6 +274,7 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
         }
     }
     int32_t p0_top;
+    std::vector<float> p0_logits; // полный вектор логитов p0 (sampled_mode)
     tokens_t tail;
     if (m < L) {
         tail.assign(prefix.begin() + m, prefix.end());
@@ -274,6 +301,7 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
         }
         const float * row = llama_get_logits_ith(v.ctx, p0_idx);
         if (!row) { err = "no p0 logits"; return {}; }
+        if (sampled_mode) p0_logits.assign(row, row + v.n_vocab);
         p0_top = argmax_row(row, v.n_vocab);
         v.cached.insert(v.cached.end(), tail.begin(), tail.end()); // cached == prefix
     } else {
@@ -321,6 +349,7 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
         }
     }
     std::vector<tokens_t> targ(n_chains); // argmax строки под каждый токен цепочки
+    std::vector<std::vector<float>> rows_logits; // полные строки логитов (sampled_mode)
     if (sumK > 0) {
         llama_batch b = llama_batch_init((int) sumK, 0, (int32_t) v.p.n_seq_max);
         std::vector<int> chain_bidx; chain_bidx.reserve((size_t) sumK);
@@ -344,27 +373,82 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
             for (size_t k = 0; k < chains[i].size(); k++) {
                 const float * rp = llama_get_logits_ith(v.ctx, chain_bidx[row++]);
                 if (!rp) { err = "missing chain logits row"; return {}; }
+                if (sampled_mode) rows_logits.emplace_back(rp, rp + v.n_vocab);
                 targ[i].push_back(argmax_row(rp, v.n_vocab));
             }
         }
     }
     const int64_t t1 = ggml_time_us();
 
-    // ---------- greedy-сличение, фиксированный порядок ----------
+    // ---------- приёмка: greedy-сличение или exact/threshold (V3, SPEC min(1,p/q)) ----------
     int     win   = -1;
     int64_t win_j = 0;
-    for (int i = 0; i < n_chains && win < 0; i++) {
-        int64_t j = 0;
-        while (j < (int64_t) chains[i].size()) {
-            const int32_t want = (j == 0) ? p0_top : targ[i][(size_t) j - 1];
-            if (chains[i][j] != want) { break; }
-            j++;
-        }
-        if (j > 0) { win = i; win_j = j; }
-    }
     int32_t bonus = p0_top;
-    if (win < 0) { win = 0; win_j = 0; }
-    else { bonus = targ[win][(size_t) win_j - 1]; }
+    if (!sampled_mode) {
+        for (int i = 0; i < n_chains && win < 0; i++) {
+            int64_t j = 0;
+            while (j < (int64_t) chains[i].size()) {
+                const int32_t want = (j == 0) ? p0_top : targ[i][(size_t) j - 1];
+                if (chains[i][j] != want) { break; }
+                j++;
+            }
+            if (j > 0) { win = i; win_j = j; }
+        }
+        if (win < 0) { win = 0; win_j = 0; }
+        else { bonus = targ[win][(size_t) win_j - 1]; }
+    } else {
+        // V3 exact/threshold: независимая верификация каждой цепочки (SPEC: accept
+        // min(1,p(t)/q(t)); reject -> bonus из norm(max(0,p-q)); threshold: p(t)>tau,
+        // bonus из p; полный приём -> bonus из p). Победитель — наибольший принятый
+        // префикс. Дистрибутивная точность гарантируется для single-chain (тест V3);
+        // multi-chain — практическое расширение (D-016).
+        if ((int) rows_logits.size() != sumK) { err = "internal: rows_logits missing"; return {}; }
+        auto mkdist = [&](const std::vector<float> & lg) {
+            std::vector<double> w(lg.size());
+            double mx = -1e30;
+            for (float x : lg) mx = std::max(mx, (double) x);
+            double ssum = 0;
+            for (size_t i = 0; i < lg.size(); i++) { w[i] = std::exp(((double) lg[i] - mx) / temp); ssum += w[i]; }
+            for (auto & x : w) x /= ssum;
+            return w;
+        };
+        int off = 0;
+        int64_t best_j = -1; int best_i = 0; int32_t best_bonus = p0_top;
+        for (int i = 0; i < n_chains; i++) {
+            const auto & ch = chains[i];
+            int64_t j = 0; int32_t bns = p0_top;
+            for (size_t k = 0; k < ch.size(); k++) {
+                const auto w = mkdist(rows_logits[off + (int) k]);
+                const double p_t = w[ch[k]];
+                bool ok;
+                if (mode == "exact") {
+                    std::uniform_real_distribution<double> ud(0.0, 1.0);
+                    ok = ud(rng) < std::min(1.0, p_t / qs[i][k]);
+                } else {
+                    ok = p_t > tau;
+                }
+                if (!ok) {
+                    if (mode == "exact") { // bonus из norm(max(0, p-q))
+                        std::vector<double> r(w.size()); double ssum = 0;
+                        for (size_t z = 0; z < w.size(); z++) { r[z] = std::max(0.0, w[z] - qs[i][k]); ssum += r[z]; }
+                        if (ssum > 0) { std::discrete_distribution<int32_t> dd(r.begin(), r.end()); bns = dd(rng); }
+                        else { bns = (int32_t) (std::max_element(w.begin(), w.end()) - w.begin()); }
+                    } else { // bonus из p
+                        std::discrete_distribution<int32_t> dd(w.begin(), w.end()); bns = dd(rng);
+                    }
+                    break;
+                }
+                j++;
+            }
+            if (j == (int64_t) ch.size()) { // полный приём: bonus из p на последней строке
+                const auto w = mkdist(rows_logits[off + (int) ch.size() - 1]);
+                std::discrete_distribution<int32_t> dd(w.begin(), w.end()); bns = dd(rng);
+            }
+            if (best_j < 0 || j > best_j) { best_j = j; best_i = i; best_bonus = bns; }
+            off += (int) ch.size();
+        }
+        win = best_i; win_j = std::max<int64_t>(best_j, 0); bonus = best_bonus;
+    }
 
     // ---------- коммит ----------
     if (single_chain) {
@@ -414,6 +498,7 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
     json tokens_out = json::array();
     for (int64_t k = 0; k < win_j; k++) { tokens_out.push_back(chains[win][k]); }
     tokens_out.push_back(bonus);
+    out["mode"]         = mode;
     out["chain_id"]     = win;
     out["accepted"]     = win_j;
     out["bonus_token"]  = bonus;
@@ -1058,6 +1143,7 @@ int main(int argc, char ** argv) {
         if (!err.empty()) {
             json e; e["error"] = err;
             res.status = (err.find("not implemented") != std::string::npos ||
+                          err.find("requires") != std::string::npos ||
                           err.find("must") != std::string::npos ||
                           err.find("exceeds") != std::string::npos ||
                           err.find("out of vocab") != std::string::npos ||
@@ -1153,6 +1239,71 @@ int main(int argc, char ** argv) {
         res.status = code;
         res.set_content(payload.dump(), "application/json");
     });
+    // V3: stateless-сэмплер «драфтера» для статистического теста exact-режима:
+    // 1 токен из softmax(logits/temp); возвращает токен и его вероятность q(t).
+    srv.Post("/vsample", [&](const httplib::Request & req, httplib::Response & res) {
+        std::lock_guard<std::mutex> lock(v.mu);
+        if (!v.sessions.empty()) { res.status = 409; res.set_content("{\"error\":\"sessions active; /vsample is stateless-only\"}", "application/json"); return; }
+        json body;
+        try { body = json::parse(req.body); } catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
+        const double temp = body.value("temp", 1.0);
+        if (!(temp > 0.0)) { res.status = 400; res.set_content("{\"error\":\"temp must be > 0\"}", "application/json"); return; }
+        if (!body.contains("prefix_tokens") || !body["prefix_tokens"].is_array() || body["prefix_tokens"].empty()) {
+            res.status = 400; res.set_content("{\"error\":\"prefix_tokens must be non-empty array\"}", "application/json"); return; }
+        tokens_t prefix;
+        for (const auto & t : body["prefix_tokens"]) {
+            if (!t.is_number_integer()) { res.status = 400; res.set_content("{\"error\":\"prefix must be ints\"}", "application/json"); return; }
+            llama_token id = t.get<llama_token>();
+            if (id < 0 || id >= v.n_vocab) { res.status = 400; res.set_content("{\"error\":\"token out of vocab\"}", "application/json"); return; }
+            prefix.push_back(id);
+        }
+        const unsigned vseed = body.value("seed", (unsigned) std::chrono::steady_clock::now().time_since_epoch().count());
+        std::mt19937 rng(vseed);
+        std::string err;
+        int64_t m = 0;
+        {
+            const int64_t cmax = std::min((int64_t) v.cached.size(), (int64_t) prefix.size());
+            while (m < cmax && v.cached[m] == prefix[m]) { m++; }
+            if (m < (int64_t) v.cached.size()) {
+                if (llama_memory_seq_rm(v.mem, 0, (llama_pos) m, -1)) { v.cached.resize(m); }
+                else { llama_memory_seq_rm(v.mem, 0, -1, -1); v.cached.clear(); m = 0; }
+                v.p0_invalidate();
+            }
+        }
+        const int64_t L = (int64_t) prefix.size();
+        tokens_t tail;
+        if (m == L) { // полный дистрибутив p0: кэш argmax недостаточен — откат 1 токена
+            if (llama_memory_seq_rm(v.mem, 0, (llama_pos) (L - 1), -1)) { v.cached.resize((size_t)(L - 1)); m = L - 1; }
+            else { llama_memory_seq_rm(v.mem, 0, -1, -1); v.cached.clear(); m = 0; }
+        }
+        if (m < L) tail.assign(prefix.begin() + m, prefix.end());
+        if (tail.empty()) { res.status = 409; res.set_content("{\"error\":\"empty tail\"}", "application/json"); return; }
+        llama_batch b = llama_batch_init((int) tail.size(), 0, 1);
+        for (size_t i = 0; i < tail.size(); i++) {
+            const int k = b.n_tokens;
+            b.token[k] = tail[i]; b.pos[k] = (llama_pos) (m + (llama_pos) i);
+            b.n_seq_id[k] = 1; b.seq_id[k][0] = 0;
+            b.logits[k] = (i + 1 == tail.size()) ? 1 : 0;
+            b.n_tokens++;
+        }
+        if (!decode_full(v, b, err)) { llama_batch_free(b); res.status = 500; res.set_content(json{{"error", "decode: " + err}}.dump(), "application/json"); return; }
+        llama_batch_free(b);
+        v.cached.insert(v.cached.end(), tail.begin(), tail.end());
+        v.p0_len = L; v.p0_top = -1;
+        const float * row = llama_get_logits_ith(v.ctx, (int) tail.size() - 1);
+        if (!row) { res.status = 500; res.set_content("{\"error\":\"no logits\"}", "application/json"); return; }
+        std::vector<double> w(v.n_vocab);
+        double mx = -1e30;
+        for (int i = 0; i < v.n_vocab; i++) mx = std::max(mx, (double) row[i]);
+        double ssum = 0;
+        for (int i = 0; i < v.n_vocab; i++) { w[i] = std::exp(((double) row[i] - mx) / temp); ssum += w[i]; }
+        for (auto & x : w) x /= ssum;
+        std::discrete_distribution<int32_t> dd(w.begin(), w.end());
+        const int32_t tok = dd(rng);
+        json out; out["token"] = tok; out["prob"] = w[tok];
+        res.set_content(out.dump(), "application/json");
+    });
+
     srv.Get("/vstats", [&](const httplib::Request & /*req*/, httplib::Response & res) {
         std::lock_guard<std::mutex> lk(v.qmu);
         json j;
