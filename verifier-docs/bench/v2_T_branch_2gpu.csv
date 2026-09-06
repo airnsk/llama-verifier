@@ -1,0 +1,13 @@
+K,N,median_verify_ms,rows,ms_per_row,regime
+2,1,53.1,2,26.6,branch_2gpu_ngl999_np5_rs0_prefix504
+2,2,75.9,4,19.0,branch_2gpu_ngl999_np5_rs0_prefix504
+2,4,129.6,8,16.2,branch_2gpu_ngl999_np5_rs0_prefix504
+4,1,69.7,4,17.4,branch_2gpu_ngl999_np5_rs0_prefix504
+4,2,119.5,8,14.9,branch_2gpu_ngl999_np5_rs0_prefix504
+4,4,109.6,16,6.8,branch_2gpu_ngl999_np5_rs0_prefix504
+8,1,116.5,8,14.6,branch_2gpu_ngl999_np5_rs0_prefix504
+8,2,106.3,16,6.6,branch_2gpu_ngl999_np5_rs0_prefix504
+8,4,179.0,32,5.6,branch_2gpu_ngl999_np5_rs0_prefix504
+12,1,90.3,12,7.5,branch_2gpu_ngl999_np5_rs0_prefix504
+12,2,124.9,24,5.2,branch_2gpu_ngl999_np5_rs0_prefix504
+12,4,204.9,48,4.3,branch_2gpu_ngl999_np5_rs0_prefix504
