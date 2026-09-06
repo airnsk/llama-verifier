@@ -73,6 +73,9 @@ struct vparams {
     int32_t     n_rs_seq  = 0;
     bool        flash_attn = true;
     bool        no_mmap    = false;
+    // Блок 0.1 плана V2: переключатель kv_unified для замера equivalence
+    // (unified = мета-шаринг ячеек seq_cp; non-unified = cross-stream cp).
+    bool        kv_unified = true;
 };
 
 struct verifier {
@@ -247,8 +250,10 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
     //   относительно реплейса. Ствол используется ТОЛЬКО для sequential K=1 отката
     //   (rs=18) — см. p0/rollback выше. Все батчи цепочек: seq 1..N, rs=0, --np >= N+1.
     const bool single_chain = false;
-    if (v.p.n_rs_seq > 0 && v.p.n_seq_max > 1) {
-        err = "rs snapshots consume ~96MiB per (seq x snapshot): launch branches with --rs 0 (trunk sequential mode needs --np 1 --rs >= 18)"; return {};
+    // rs-снапшоты: ~96 MiB на (seq × snapshot). Для теста границы отката (V2-план 0.2)
+    // разрешаем np<=2 с rs>0 (ствол + 1 ветка); больше — по-прежнему ОМВ-риск.
+    if (v.p.n_rs_seq > 0 && v.p.n_seq_max > 2) {
+        err = "rs snapshots consume ~96MiB per (seq x snapshot): launch branches with --rs 0 (rollback-depth probe needs --np 2 --rs N)"; return {};
     }
     if (n_chains + 1 > v.p.n_seq_max) {
         err = "not enough seqs for branch mode: need --np >= chains+1"; return {};
@@ -497,6 +502,7 @@ int main(int argc, char ** argv) {
         else if (a == "-fa")          pp.flash_attn = next() == "on";
         else if (a == "--rs")         pp.n_rs_seq = std::stoi(next());
         else if (a == "--no-mmap")    pp.no_mmap = true;
+        else if (a == "--kvu")        pp.kv_unified = (next() == "on");
         else if (a == "-h" || a == "--help") {
             printf("llama-verifier -m <gguf> [--host h] [--port p] [-ngl n] [-c ctx]"
                    " [-np n_branches] [-t n] [-b n] [-ub n] [-fa on|off] [--no-mmap]\n");
@@ -527,10 +533,11 @@ int main(int argc, char ** argv) {
     cp.n_ubatch   = (uint32_t) pp.n_ubatch;
     cp.n_outputs_max = (uint32_t) pp.n_batch; // батч цепочек: до n_batch output-строк
     cp.n_rs_seq   = (uint32_t) pp.n_rs_seq;   // rs-rollback для частичного seq_rm на гибриде
-    cp.kv_unified = true;                     // ОДИН стрим: seq_cp = мета-шаринг ячеек
+    cp.kv_unified = pp.kv_unified;          // ОДИН стрим: seq_cp = мета-шаринг ячеек
                                               // (cross-stream cp GGML_ABORT'ит на частичных
                                               // диапазонах и копирует весь буфер — 0.8-3.4с/раунд,
                                               // замерено 06.09 13:34; D-006)
+                                              // --kvu off: эксперимент Блок 0.1 (V2-план)
     cp.flash_attn_type = pp.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     v.ctx = llama_init_from_model(v.model, cp);
     if (!v.ctx) { fprintf(stderr, "failed to init context\n"); llama_model_free(v.model); return 2; }
