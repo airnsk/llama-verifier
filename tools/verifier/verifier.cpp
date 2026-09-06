@@ -41,12 +41,19 @@
 #include <algorithm>
 #include <cinttypes>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <future>
 #include <mutex>
 #include <signal.h>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using json = nlohmann::json;
@@ -64,6 +71,9 @@ struct vparams {
     int32_t     n_threads = 0;
     int32_t     n_batch   = 2048;
     int32_t     n_ubatch  = 512;
+    // V2 (план V2.1): окно склейки запросов сессий в один батч (SPEC ~5–10 мс)
+    int         window_ms = 8;
+    int         max_queue = 64;   // глубина pending-очереди, выше — 429
     // снапшоты рекурентного состояния на seq: частичный rollback на гибриде qwen35
     // возможен только в пределах n_rs_seq (COMMON_CONTEXT_SEQ_RM_TYPE_RS).
     // ПАМЯТЬ: ~96 MiB на (seq × snapshot) на этом стенде (замер OOM 13:55: 8seq×16rs
@@ -78,6 +88,26 @@ struct vparams {
     bool        kv_unified = true;
 };
 
+// ================== V2: сессии + очередь-склейка (план V2.1) ==================
+// Слот сессии = 2 seq: trunk (префикс, живёт между раундами) + branch (цепочка,
+// сноситсЯ полным rm). seq 0 зарезервирован за stateless /vverify (не смешивать).
+struct vsession {
+    int32_t   slot = -1;              // trunk=2*slot+1, branch=2*slot+2
+    tokens_t  cached;                 // == принятая история сессии (логический ствол)
+    int64_t   kv_len = 0;             // ячейки ствола [0, kv_len); delta = cached[kv_len..)
+    int32_t   p0_top = -1;            // валиден при p0_len == cached.size()
+    int64_t   p0_len = -1;
+    void invalidate() { p0_top = -1; p0_len = -1; }
+};
+
+struct Pending {
+    int64_t  sid = -1;
+    tokens_t prefix, chain;
+    std::chrono::steady_clock::time_point t_enq{};
+    double   queue_ms = 0.0;
+    std::promise<std::pair<int, json>> pr;  // {http_code, payload}
+};
+
 struct verifier {
     vparams p;
 
@@ -90,7 +120,18 @@ struct verifier {
     tokens_t      cached;   // == ствол seq0 (принятые + префикс последнего раунда)
     int32_t       p0_top = -1;   // argmax p0 после cached.back(); валиден при p0_len
     int64_t       p0_len = -1;
-    std::mutex    mu;            // сериализация раундов (v1: одна очередь)
+    std::mutex    mu;            // сериализация раундов (/vverify и worker)
+
+    // V2-состояние (sessions — под mu; очередь — под qmu)
+    std::unordered_map<int64_t, vsession>   sessions;
+    std::unordered_map<int32_t, int64_t>    slot_owner;
+    std::deque<std::shared_ptr<Pending>>    queue;
+    std::unordered_set<int64_t>             qbusy;
+    std::mutex              qmu;
+    std::condition_variable qcv;
+    std::atomic<bool>       stop_flag{false};
+    std::atomic<uint64_t>   enq{0}, rejected{0}, batches{0}, sess_rounds{0};
+    std::atomic<int64_t>    sid_next{0};
 
     std::atomic<uint64_t> rounds{0};
     std::atomic<uint64_t> round_tokens{0};
@@ -119,6 +160,7 @@ static bool decode_full(verifier & v, const llama_batch & batch, std::string & e
 
 static json round_verify(verifier & v, const json & req, std::string & err) {
     std::lock_guard<std::mutex> lock(v.mu);
+    if (!v.sessions.empty()) { err = "stateless /vverify cannot run while sessions are active (/vclose them first)"; return {}; }
 
     // ---------- разбор/валидация ----------
     const std::string mode = req.value("mode", std::string("greedy"));
@@ -356,7 +398,11 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
             v.p0_len = (int64_t) v.cached.size();
         }
     } else {
-        // ленивый: ствол = prefix (в KV уже ровно [0,L)); ветки — полным rm
+        // ленивый (D-006, проверено 1000 раундов 0.2): ствол остаётся == prefix
+        // (в KV ровно [0,L)); accepted досчитает следующий раунд как delta-pp.
+        // НЕ пишем cached=prefix+accepted: ячеек для них в стволе нет — позиция
+        // встанет встык к мнимому концу и тихо рассинхронит GDN (проверено на
+        // стенде в ранней версии этого коммита, откачено).
         for (int i = 0; i < n_chains; i++) {
             llama_memory_seq_rm(v.mem, (llama_seq_id) (i + 1), -1, -1);
         }
@@ -387,7 +433,6 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
 
 
 // ================== /dbg_batch — эксперимент "маска vs GDN-состояние" (06.09 15:00) ==================
-// Сигнатура 14:30: батч K=16 принимает 1 токен, последовательно 16/16.
 //   H1: в нашем батче позиции цепочки не аттендят друг друга (argmax p2 == argmax p1).
 //   H2: GDN-состояние не продвигается внутри multi-token ubatch (p2 != p1 и != seq).
 // Запрос: {"chain":[...K],"probe":"A"|"B"|"AB"} — ствол должен быть ровно на len(prefix).
@@ -482,6 +527,367 @@ static json dbg_batch(verifier & v, const json & req, std::string & err) {
     return out;
 }
 
+// ================== V2: сессии + очередь-склейка (план V2.1) ==================
+// Все функции ниже требуют v.mu (кроме очереди — v.qmu).
+// Ствол сессии: seq 2*slot+1, ветка: 2*slot+2. seq 0 — только stateless /vverify.
+// Тёплый раунд: дельта-pp (принятые+bonus прошлого раунда, 1..K+1 токенов) одним общим
+// батчем по всем сессиям (разные seq — разные стволы, маски не смешиваются), затем
+// seq_cp ствол->ветка (мета-шаринг, unified KV, D-006) и ОДИН батч цепочек на ветках.
+
+static int32_t find_free_slot(verifier & v) {
+    const int32_t smax = (v.p.n_seq_max - 1) / 2;
+    for (int32_t s = 0; s < smax; s++) {
+        if (!v.slot_owner.count(2 * s + 1) && !v.slot_owner.count(2 * s + 2)) return s;
+    }
+    return -1;
+}
+
+// Протянуть ствол сессии до == prefix; вернуть p0 (argmax под последним токеном).
+// Возвращает false + err при провале decode. Вызывается с удержанным v.mu.
+static bool trunk_extend(verifier & v, vsession & s, const tokens_t & prefix,
+                         int32_t & p0, std::string & err) {
+    const int64_t L = (int64_t) prefix.size();
+    const llama_seq_id tr = (llama_seq_id) (2 * s.slot + 1);
+    int64_t m = 0;
+    const int64_t cmax = std::min((int64_t) s.cached.size(), L);
+    while (m < cmax && s.cached[m] == prefix[m]) m++;
+    if (m < (int64_t) s.cached.size()) {   // ретракция/рассогласование — полный reset
+        llama_memory_seq_rm(v.mem, tr, -1, -1);   // целая секвенция — гарантированно ок
+        s.cached.clear(); s.kv_len = 0; s.invalidate();
+        m = 0;
+    }
+    p0 = -1;
+    if (m == L && s.p0_len == L && s.p0_top >= 0) { p0 = s.p0_top; return true; }
+
+    tokens_t delta;
+    llama_pos dpos = 0;
+    if (m == L) { // ствол==prefix, p0 нет: откат 1 токена + досчёт (путь V1, b02d d=1 ок)
+        bool ok = llama_memory_seq_rm(v.mem, tr, (llama_pos) (L - 1), -1);
+        if (ok && llama_memory_seq_pos_max(v.mem, tr) >= (llama_pos) (L - 1)) ok = false;
+        if (ok) { delta.push_back(prefix[L - 1]); dpos = (llama_pos) (L - 1); s.kv_len = L - 1; }
+        else { // не вышло — полный reset, досчёт всего
+            llama_memory_seq_rm(v.mem, tr, -1, -1);
+            s.cached.clear(); s.kv_len = 0; s.invalidate();
+            m = 0;
+        }
+    }
+    if (p0 < 0) {
+        if (m < L) { delta.assign(prefix.begin() + m, prefix.end()); dpos = (llama_pos) m; }
+        size_t off = 0;
+        int p0_idx = 0;
+        while (off < delta.size()) {
+            const size_t cnt = std::min((size_t) v.p.n_batch, delta.size() - off);
+            const bool last_chunk = (off + cnt == delta.size());
+            p0_idx = (int) cnt - 1;
+            llama_batch b = llama_batch_init((int) cnt, 0, 1);
+            for (size_t i = 0; i < cnt; i++) {
+                const int t = b.n_tokens;
+                b.token[t] = delta[off + i];
+                b.pos[t] = (llama_pos) (dpos + off + i);
+                b.n_seq_id[t] = 1; b.seq_id[t][0] = tr; b.logits[t] = 1; // p0 нужен с каждой
+                b.n_tokens++;                                             // чанки — см. V1
+            }
+            if (!decode_full(v, b, err)) { llama_batch_free(b); return false; }
+            const float * rp = llama_get_logits_ith(v.ctx, p0_idx);
+            if (!rp) { err = "delta row missing"; llama_batch_free(b); return false; }
+            p0 = argmax_row(rp, v.n_vocab);
+            llama_batch_free(b);
+            off += cnt;
+        }
+        s.cached = prefix;
+        s.kv_len = L;
+        s.p0_top = p0; s.p0_len = L;
+    }
+    return true;
+}
+
+// Обработать батч запросов сессий одним (или двумя при переполнении) декодами.
+// Каждый Pending = одна цепочка одной сессии. Возвращает true, если батч валиден
+// по бюджетам (иначе заполняет promises ошибкой).
+// Собрать дельту сессии в общий батч невозможно динамически — plan phase считает
+// заранее: RETR/DELTA/P0OK/MISS по текущему состоянию кэша.
+enum plan_mode { PM_P0OK, PM_MISS, PM_DELTA, PM_RETR };
+struct sitem {
+    std::shared_ptr<Pending> r;
+    vsession * s;
+    int mode = PM_DELTA;
+    llama_pos dpos = 0;        // начало дельты в позициях
+    int64_t dcnt = 0;          // токенов дельты (RETR -> вся длина префикса)
+    int last_row = -1;         // индекс токена в общем батче (логиты p0)
+    int32_t p0 = -1;
+    bool ok = true;            // false -> ответ уже выставлен
+};
+
+static void reset_session(verifier & v, vsession & s) {
+    const llama_seq_id tr = (llama_seq_id) (2 * s.slot + 1);
+    const llama_seq_id br = (llama_seq_id) (2 * s.slot + 2);
+    llama_memory_seq_rm(v.mem, tr, -1, -1);
+    llama_memory_seq_rm(v.mem, br, -1, -1);
+    s.cached.clear(); s.kv_len = 0; s.invalidate();
+}
+
+static void session_batch(verifier & v, std::vector<std::shared_ptr<Pending>> & reqs) {
+    const int64_t t_beg = ggml_time_us();
+    // stateless-остатки seq0: режимы взаимоисключающие, чистим перед батчем
+    if (!v.cached.empty() || v.p0_len >= 0) {
+        llama_memory_seq_rm(v.mem, 0, -1, -1);
+        v.cached.clear(); v.p0_invalidate();
+    }
+
+    std::vector<sitem> items;
+    int64_t cells = 0, sumK = 0;
+    for (auto & r : reqs) {
+        auto it = v.sessions.find(r->sid);
+        if (it == v.sessions.end()) { r->pr.set_value({404, json{{"error", "no such session"}}}); continue; }
+        if (r->prefix.empty() || r->chain.empty()) {
+            r->pr.set_value({400, json{{"error", "prefix_tokens/chain non-empty required"}}}); continue;
+        }
+        bool bad = false;
+        for (auto t : r->prefix) if (t < 0 || t >= v.n_vocab) { bad = true; break; }
+        if (!bad) for (auto t : r->chain) if (t < 0 || t >= v.n_vocab) { bad = true; break; }
+        if (bad) { r->pr.set_value({400, json{{"error", "token id out of vocab"}}}); continue; }
+        sitem x; x.r = r; x.s = &it->second;
+        const int64_t L = (int64_t) r->prefix.size();
+        int64_t m = 0;
+        const int64_t cmax = std::min((int64_t) x.s->cached.size(), L);
+        while (m < cmax && x.s->cached[m] == r->prefix[m]) m++;
+        if (m < (int64_t) x.s->cached.size()) { x.mode = PM_RETR; x.dcnt = L; }
+        else if (m < L)                        { x.mode = PM_DELTA; x.dpos = (llama_pos) m; x.dcnt = L - m; }
+        else if (x.s->p0_len == L && x.s->p0_top >= 0) { x.mode = PM_P0OK; x.p0 = x.s->p0_top; x.dcnt = 0; }
+        else                                   { x.mode = PM_MISS; x.dcnt = L; }
+        // PM_MISS при m==L (частый случай: клиент вернул accepted+bonus, дублик
+        // последнего в стволе не валиден) НЕ трогаем ствол: p0 досчитывается на
+        // ВЕТКЕ (seq_cp ствола + decode 1 токена). Замер 06.09 18:40: частичный rm
+        // +1-токен на ствол = полный reset 879 мс (V1-путь, для сессий неприемлем).
+        cells += L + (int64_t) r->chain.size();
+        sumK  += (int64_t) r->chain.size();
+        items.push_back(std::move(x));
+    }
+    if (items.empty()) return;
+    if (cells + 16 > (int64_t) llama_n_ctx(v.ctx)) {
+        for (auto & x : items) x.r->pr.set_value({429, json{{"error", "kv cell budget exceeded"}, {"retry_after", 1}}});
+        return;
+    }
+    if (sumK > (int64_t) v.p.n_batch) {
+        for (auto & x : items) x.r->pr.set_value({429, json{{"error", "chain tokens over n_batch"}, {"retry_after", 1}}});
+        return;
+    }
+    // ветки несут собственные ячейки цепочки ПОВЕРХ ствола: бюджет = cells + sumK + 16
+    if (sumK + 16 > (int64_t) llama_n_ctx(v.ctx) - cells) {
+        for (auto & x : items) x.r->pr.set_value({429, json{{"error", "kv cell budget exceeded (branches)"}, {"retry_after", 1}}});
+        return;
+    }
+
+    // ---------- фаза 1: дельта-pp ----------
+    const int64_t t_p0 = ggml_time_us();
+    int64_t batch_delta = 0;
+    for (auto & x : items) if (x.mode == PM_RETR || x.mode == PM_DELTA) batch_delta += x.dcnt;
+    std::vector<sitem *> miss;
+    for (auto & x : items) if (x.mode == PM_MISS) miss.push_back(&x);
+
+    // PM_MISS с полным совпадением кэша (m==L): p0 на ветке, ствол не трогаем.
+    // Позиция L-1 на ветке валидна: ветка ≠ ствол, повтор позиции внутри другой
+    // секвенции — разрешено (пересчёт позиции ВНУТРИ seq запрещён).
+    {
+        llama_batch bp = llama_batch_init((int) miss.size(), 0, 1);
+        for (auto * x : miss) {
+            const int64_t L = (int64_t) x->r->prefix.size();
+            if (x->s->kv_len != L) continue; // ретракция/рассогласование — в seq-путь
+            const llama_seq_id br = (llama_seq_id) (2 * x->s->slot + 2);
+            if (bp.n_tokens + 1 > v.p.n_batch) continue;
+            llama_memory_seq_rm(v.mem, br, -1, -1);
+            // копия ТОЛЬКО [0, L-1): токен на L-1 досчитывается на ветке ПЕРВЫЙ раз
+            // (cp всего [0,L) + decode на L-1 = двойной advance GDN — строгое правило
+            //  X>max внутри seq; замер V1 14:30). Ветка ≠ ствол — позиция валидна.
+            llama_memory_seq_cp(v.mem, (llama_seq_id) (2 * x->s->slot + 1), br, 0, (llama_pos) (L - 1));
+            const int t = bp.n_tokens;
+            bp.token[t] = x->r->prefix[(size_t) (L - 1)];
+            bp.pos[t] = (llama_pos) (L - 1);
+            bp.n_seq_id[t] = 1; bp.seq_id[t][0] = br; bp.logits[t] = 1;
+            bp.n_tokens++;
+            x->last_row = t; // маркер: обработана здесь
+        }
+        if (bp.n_tokens > 0) {
+            std::string e;
+            if (!decode_full(v, bp, e)) {
+                llama_batch_free(bp);
+                for (auto * x : miss) if (x->last_row >= 0) {
+                    x->ok = false; x->p0 = -1;
+                    x->r->pr.set_value({500, json{{"error", "p0 branch: " + e}}});
+                    x->last_row = -2; // не обрабатывать ниже
+                }
+            } else {
+                for (auto * x : miss) {
+                    if (x->last_row < 0) continue;
+                    const float * rp = llama_get_logits_ith(v.ctx, x->last_row);
+                    if (!rp) { x->ok = false; x->p0 = -1; x->last_row = -2;
+                               x->r->pr.set_value({500, json{{"error", "p0 branch row missing"}}}); continue; }
+                    x->p0 = argmax_row(rp, v.n_vocab);
+                    x->s->p0_top = x->p0; x->s->p0_len = (int64_t) x->s->cached.size();
+                    x->last_row = -2;
+                }
+            }
+        }
+        llama_batch_free(bp);
+    }
+    for (auto & x : items) if (x.mode == PM_MISS) miss.push_back(&x);
+
+    if (batch_delta > 0 && batch_delta <= (int64_t) v.p.n_batch) {
+        llama_batch b = llama_batch_init((int) batch_delta, 0, 1);
+        for (auto & x : items) {
+            if (x.mode != PM_RETR && x.mode != PM_DELTA) continue;
+            const int64_t L = (int64_t) x.r->prefix.size();
+            const llama_seq_id tr = (llama_seq_id) (2 * x.s->slot + 1);
+            if (x.mode == PM_RETR) { // хвост невалиден — полный сброс ствола, pp всего префикса
+                llama_memory_seq_rm(v.mem, tr, -1, -1);
+                x.s->cached.clear(); x.s->kv_len = 0; x.s->invalidate();
+            }
+            for (int64_t i = 0; i < x.dcnt; i++) {
+                const int t = b.n_tokens;
+                b.token[t] = x.r->prefix[(size_t) (L - x.dcnt + i)]; // RETR: с 0, DELTA: с m
+                b.pos[t] = (llama_pos) (x.mode == PM_RETR ? i : x.dpos + i);
+                b.n_seq_id[t] = 1; b.seq_id[t][0] = tr;
+                b.logits[t] = (i + 1 == x.dcnt) ? 1 : 0; // строка p0 — только последняя
+                b.n_tokens++;
+                if (i + 1 == x.dcnt) x.last_row = t;
+            }
+            x.s->cached = x.r->prefix; x.s->kv_len = L; // подтверждается успехом decode
+        }
+        std::string e;
+        if (!decode_full(v, b, e)) {
+            llama_batch_free(b);
+            for (auto & x : items) {
+                if (x.mode == PM_RETR || x.mode == PM_DELTA) { reset_session(v, *x.s); x.ok = false; }
+                x.r->pr.set_value({500, json{{"error", "delta decode: " + e}}});
+            }
+            return;
+        }
+        llama_batch_free(b);
+        for (auto & x : items) {
+            if (x.mode == PM_RETR || x.mode == PM_DELTA) {
+                const float * rp = llama_get_logits_ith(v.ctx, x.last_row);
+                if (!rp) { reset_session(v, *x.s); x.ok = false;
+                           x.r->pr.set_value({500, json{{"error", "delta row missing"}}}); continue; }
+                x.p0 = argmax_row(rp, v.n_vocab);
+                x.s->p0_top = x.p0; x.s->p0_len = (int64_t) x.r->prefix.size();
+            }
+        }
+    } else if (batch_delta > 0) { // всё последовательно (крупный re-prefill, редкий путь)
+        for (auto & x : items) {
+            if (x.mode != PM_RETR && x.mode != PM_DELTA) continue;
+            std::string e;
+            if (!trunk_extend(v, *x.s, x.r->prefix, x.p0, e) || x.p0 < 0) {
+                reset_session(v, *x.s); x.ok = false;
+                x.r->pr.set_value({500, json{{"error", "delta seq: " + e}}});
+            }
+        }
+    }
+    for (auto * x : miss) { // оставшиеся (реальные ретракции/рассогласования, редкие)
+        if (!x->ok || x->p0 >= 0) continue;
+        std::string e;
+        if (!trunk_extend(v, *x->s, x->r->prefix, x->p0, e) || x->p0 < 0) {
+            reset_session(v, *x->s); x->p0 = -1; x->ok = false;
+            x->r->pr.set_value({500, json{{"error", "p0 miss: " + (e.empty() ? std::string("no p0") : e)}}});
+        }
+    }
+    items.erase(std::remove_if(items.begin(), items.end(), [](sitem & y){ return !y.ok || y.p0 < 0; }), items.end());
+    if (items.empty()) return;
+    const int64_t t_delta = ggml_time_us();
+
+    // ---------- фаза 2: ветки + общий батч цепочек ----------
+    std::vector<int> tok2item;
+    llama_batch b2 = llama_batch_init((int) sumK, 0, 1);
+    for (size_t ii = 0; ii < items.size(); ii++) {
+        auto & x = items[ii];
+        const int64_t L = (int64_t) x.r->prefix.size();
+        const llama_seq_id tr = (llama_seq_id) (2 * x.s->slot + 1);
+        const llama_seq_id br = (llama_seq_id) (2 * x.s->slot + 2);
+        llama_memory_seq_rm(v.mem, br, -1, -1);
+        llama_memory_seq_cp(v.mem, tr, br, 0, (llama_pos) L); // мета-шаринг ствола (D-006)
+        for (size_t k = 0; k < x.r->chain.size(); k++) {
+            const int t = b2.n_tokens;
+            b2.token[t] = x.r->chain[k];
+            b2.pos[t] = (llama_pos) (L + k);
+            b2.n_seq_id[t] = 1; b2.seq_id[t][0] = br; b2.logits[t] = 1;
+            b2.n_tokens++;
+            tok2item.push_back((int) ii);
+        }
+    }
+    std::string e2;
+    if (!decode_full(v, b2, e2)) {
+        llama_batch_free(b2);
+        for (auto & x : items) x.r->pr.set_value({500, json{{"error", "chain decode: " + e2}}});
+        return;
+    }
+    std::vector<tokens_t> targ(items.size());
+    for (int t = 0; t < b2.n_tokens; t++) {
+        const float * rp = llama_get_logits_ith(v.ctx, t);
+        if (!rp) { llama_batch_free(b2);
+                   for (auto & x : items) x.r->pr.set_value({500, json{{"error", "chain row missing"}}}); return; }
+        targ[(size_t) tok2item[t]].push_back(argmax_row(rp, v.n_vocab));
+    }
+    llama_batch_free(b2);
+    const int64_t t_chain = ggml_time_us();
+
+    // ---------- фаза 3: greedy-сличение, ответы, снятие веток ----------
+    for (size_t ii = 0; ii < items.size(); ii++) {
+        auto & x = items[ii];
+        const llama_seq_id br = (llama_seq_id) (2 * x.s->slot + 2);
+        int64_t j = 0;
+        while (j < (int64_t) x.r->chain.size()) {
+            const int32_t want = (j == 0) ? x.p0 : targ[ii][(size_t) j - 1];
+            if (x.r->chain[j] != want) break;
+            j++;
+        }
+        int32_t bonus = x.p0;
+        if (j > 0) bonus = targ[ii][(size_t) j - 1];
+        json out;
+        json tout = json::array();
+        for (int64_t k = 0; k < j; k++) tout.push_back(x.r->chain[k]);
+        tout.push_back(bonus);
+        out["chain_id"]       = 0;
+        out["accepted"]       = j;
+        out["bonus_token"]    = bonus;
+        out["tokens_out"]     = tout;
+        out["queue_ms"]       = x.r->queue_ms;
+        out["prefill_ms"]     = (double) (t_delta - t_p0) / 1000.0 / (double) items.size(); // доля на сессию
+        out["verify_ms"]      = (double) (t_chain - t_delta) / 1000.0;                      // общий на батч
+        out["round_ms"]       = (double) (ggml_time_us() - t_beg) / 1000.0 + x.r->queue_ms;
+        out["batch_sessions"] = (int64_t) items.size();
+        x.r->pr.set_value({200, out});
+        llama_memory_seq_rm(v.mem, br, -1, -1); // ветка — полный rm (всегда ок);
+        // ленивый коммит: cached остаётся == prefix (фаза 1), accepted досчитает
+        // следующий раунд дельтой (D-006)
+    }
+    v.batches++;
+    v.sess_rounds += (uint64_t) items.size();
+    v.round_tokens += (uint64_t) sumK;
+}
+
+static void queue_worker(verifier & v) {
+    while (true) {
+        std::vector<std::shared_ptr<Pending>> batch;
+        {
+            std::unique_lock<std::mutex> lk(v.qmu);
+            v.qcv.wait(lk, [&] { return v.stop_flag.load() || !v.queue.empty(); });
+            if (v.stop_flag.load() && v.queue.empty()) break;
+            const auto due = v.queue.front()->t_enq + std::chrono::milliseconds(v.p.window_ms);
+            while (std::chrono::steady_clock::now() < due && !v.stop_flag.load()) {
+                v.qcv.wait_until(lk, due);
+            }
+            if (v.stop_flag.load()) break;
+            while (!v.queue.empty()) { batch.push_back(std::move(v.queue.front())); v.queue.pop_front(); }
+            for (auto & r : batch) v.qbusy.erase(r->sid);
+        }
+        const auto t_out = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(v.mu);
+            for (auto & r : batch) r->queue_ms = std::chrono::duration<double, std::milli>(t_out - r->t_enq).count();
+            session_batch(v, batch);
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     vparams pp;
     for (int i = 1; i < argc; i++) {
@@ -503,9 +909,13 @@ int main(int argc, char ** argv) {
         else if (a == "--rs")         pp.n_rs_seq = std::stoi(next());
         else if (a == "--no-mmap")    pp.no_mmap = true;
         else if (a == "--kvu")        pp.kv_unified = (next() == "on");
+        else if (a == "--window")     pp.window_ms = std::stoi(next());
         else if (a == "-h" || a == "--help") {
             printf("llama-verifier -m <gguf> [--host h] [--port p] [-ngl n] [-c ctx]"
-                   " [-np n_branches] [-t n] [-b n] [-ub n] [-fa on|off] [--no-mmap]\n");
+                   " [-np n_seqs] [-t n] [-b n] [-ub n] [-fa on|off] [--no-mmap]"
+                   " [--rs n] [--kvu on|off] [--window ms]\n"
+                   "  endpoints: /vverify (stateless), /vopen /vround /vclose /vstats (V2 sessions),\n"
+                   "             /tokenize /detokenize /dbg_batch /health /props\n");
             return 0;
         } else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 1; }
     }
@@ -550,6 +960,9 @@ int main(int argc, char ** argv) {
 
     httplib::Server srv;
     srv.set_payload_max_length((size_t) 256 * 1024 * 1024);
+    // V2: /vround блокируется до ответа воркера — нужен конкурентный обработчик,
+    // иначе очередь физически невозможна (httplib по умолчанию one-thread-per-connection=0)
+    srv.new_task_queue = [] { return new httplib::ThreadPool(16); };
 
     srv.Get("/health", [&](const httplib::Request & /*req*/, httplib::Response & res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
@@ -561,6 +974,10 @@ int main(int argc, char ** argv) {
         j["n_ctx"]           = (int64_t) llama_n_ctx(v.ctx);
         j["kv_cached"]       = (int64_t) v.cached.size();
         j["rounds"]          = v.rounds.load();
+        j["session_rounds"]  = v.sess_rounds.load();
+        j["batches"]         = v.batches.load();
+        j["n_sessions"]      = (int64_t) v.sessions.size();
+        j["window_ms"]       = (int64_t) v.p.window_ms;
         j["round_tokens"]    = v.round_tokens.load();
         j["accepted_tokens"] = v.accepted_tokens.load();
         res.set_content(j.dump(), "application/json");
@@ -637,17 +1054,116 @@ int main(int argc, char ** argv) {
                           err.find("must") != std::string::npos ||
                           err.find("exceeds") != std::string::npos ||
                           err.find("out of vocab") != std::string::npos ||
-                          err.find("too many") != std::string::npos) ? 400 : 500;
+                          err.find("too many") != std::string::npos ||
+                          err.find("sessions are active") != std::string::npos) ? 400 : 500;
             res.set_content(e.dump(), "application/json");
             return;
         }
         res.set_content(out.dump(), "application/json");
     });
 
+    // ================== V2: эндпоинты сессий ==================
+    srv.Post("/vopen", [&](const httplib::Request & /*req*/, httplib::Response & res) {
+        std::lock_guard<std::mutex> lock(v.mu);
+        if (v.p.n_seq_max < 3) { res.status = 500;
+            res.set_content("{\"error\":\"need --np >= 3 for session mode\"}", "application/json"); return; }
+        int32_t slot = find_free_slot(v);
+        if (slot < 0) { res.status = 429; res.set_header("Retry-After", "1");
+            res.set_content("{\"error\":\"no free slots (np/2 sessions in use)\"}", "application/json"); return; }
+        vsession s; s.slot = slot;
+        int64_t sid = v.sid_next++;
+        v.sessions[sid] = s;
+        v.slot_owner[2 * slot + 1] = sid;
+        json out; out["session_id"] = sid; out["slot"] = slot;
+        out["max_sessions"] = (v.p.n_seq_max - 1) / 2;
+        res.set_content(out.dump(), "application/json");
+    });
+    srv.Post("/vclose", [&](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
+        const int64_t sid = body.value("session_id", (int64_t) -1);
+        std::lock_guard<std::mutex> lock(v.mu);
+        auto it = v.sessions.find(sid);
+        if (it == v.sessions.end()) { res.status = 404;
+            res.set_content("{\"error\":\"no such session\"}", "application/json"); return; }
+        v.slot_owner.erase(2 * it->second.slot + 1);
+        v.slot_owner.erase(2 * it->second.slot + 2);
+        llama_memory_seq_rm(v.mem, (llama_seq_id) (2 * it->second.slot + 1), -1, -1);
+        llama_memory_seq_rm(v.mem, (llama_seq_id) (2 * it->second.slot + 2), -1, -1);
+        v.sessions.erase(it);
+        res.set_content("{\"status\":\"closed\"}", "application/json");
+    });
+    srv.Post("/vround", [&](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return;
+        }
+        if (!body.contains("session_id") || !body["session_id"].is_number_integer()) {
+            res.status = 400; res.set_content("{\"error\":\"session_id required\"}", "application/json"); return;
+        }
+        const int64_t sid = body["session_id"].get<int64_t>();
+        if (!body.contains("prefix_tokens") || !body["prefix_tokens"].is_array() || body["prefix_tokens"].empty()
+            || !body.contains("chain") || !body["chain"].is_array() || body["chain"].empty()) {
+            res.status = 400; res.set_content("{\"error\":\"prefix_tokens and chain (non-empty arrays) required\"}", "application/json"); return;
+        }
+        if (body.contains("mode") && body["mode"].get<std::string>() != "greedy") {
+            res.status = 400; res.set_content("{\"error\":\"mode not implemented in v2\"}", "application/json"); return;
+        }
+        auto vround = std::make_shared<Pending>();
+        vround->sid = sid;
+        for (const auto & t : body["prefix_tokens"]) {
+            if (!t.is_number_integer()) { res.status = 400; res.set_content("{\"error\":\"prefix must be ints\"}", "application/json"); return; }
+            vround->prefix.push_back(t.get<llama_token>());
+        }
+        for (const auto & t : body["chain"]) {
+            if (!t.is_number_integer()) { res.status = 400; res.set_content("{\"error\":\"chain must be ints\"}", "application/json"); return; }
+            vround->chain.push_back(t.get<llama_token>());
+        }
+        std::future<std::pair<int, json>> fut = vround->pr.get_future();
+        {
+            std::lock_guard<std::mutex> sm(v.mu); // sessions под v.mu (/vclose гонка)
+            if (!v.sessions.count(sid)) { res.status = 404;
+                res.set_content("{\"error\":\"no such session\"}", "application/json"); return; }
+        }
+        {
+            std::lock_guard<std::mutex> lk(v.qmu);
+            // справедливость V2.4: очередь/слот заняты -> честный 429, не деградация
+            if ((int) v.queue.size() >= v.p.max_queue || v.qbusy.count(sid)) {
+                v.rejected++;
+                res.status = 429; res.set_header("Retry-After", "1");
+                res.set_content("{\"error\":\"queue busy\"}", "application/json"); return;
+            }
+            if (!v.sessions.count(sid)) { res.status = 404;
+                res.set_content("{\"error\":\"no such session\"}", "application/json"); return; }
+            v.qbusy.insert(sid);
+            vround->t_enq = std::chrono::steady_clock::now();
+            v.queue.push_back(vround);
+            v.enq++;
+            v.qcv.notify_one();
+        }
+        auto [code, payload] = fut.get();
+        res.status = code;
+        res.set_content(payload.dump(), "application/json");
+    });
+    srv.Get("/vstats", [&](const httplib::Request & /*req*/, httplib::Response & res) {
+        std::lock_guard<std::mutex> lk(v.qmu);
+        json j;
+        j["queue"]    = (int64_t) v.queue.size();
+        j["enq"]      = v.enq.load();
+        j["rejected"] = v.rejected.load();
+        j["batches"]  = v.batches.load();
+        j["rounds"]   = v.sess_rounds.load();
+        res.set_content(j.dump(), "application/json");
+    });
+
+    std::thread worker([&v] { queue_worker(v); });
+
     printf("verifier: listening on http://%s:%d\n", pp.host.c_str(), pp.port);
     fflush(stdout);
     if (!srv.listen(pp.host.c_str(), pp.port)) {
-        fprintf(stderr, "listen failed\n");
+        v.stop_flag = true; v.qcv.notify_all();
+        worker.join();
         llama_free(v.ctx);
         llama_model_free(v.model);
         return 3;

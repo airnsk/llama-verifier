@@ -1,0 +1,121 @@
+From 1380f64a17aa41291419cbd724144a527c7dd63f Mon Sep 17 00:00:00 2001
+From: Kim <kim@local>
+Date: Sun, 6 Sep 2026 13:08:29 +0000
+Subject: [PATCH 2/6] fix: read logits by batch token index, not by output row
+ number
+
+---
+ tools/verifier/verifier.cpp | 26 +++++++++++++++++---------
+ 1 file changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/tools/verifier/verifier.cpp b/tools/verifier/verifier.cpp
+index 322cdff79..fda98ce6d 100644
+--- a/tools/verifier/verifier.cpp
++++ b/tools/verifier/verifier.cpp
+@@ -112,7 +112,7 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
+     if (!req.contains("prefix_tokens") || !req["prefix_tokens"].is_array() || req["prefix_tokens"].empty()) {
+         err = "prefix_tokens must be a non-empty array"; return {};
+     }
+-    llama_tokens prefix;
++    std::vector<llama_token> prefix;
+     for (const auto & t : req["prefix_tokens"]) {
+         if (!t.is_number_integer()) { err = "prefix_tokens must be integers"; return {}; }
+         llama_token id = t.get<llama_token>();
+@@ -126,7 +126,7 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
+     if (n_chains > v.p.n_seq_max - 1) { // chain0 на стволе, остальные на ветках 1..n_seq_max-1
+         err = "too many chains for n_seq_max"; return {};
+     }
+-    std::vector<llama_tokens> chains(n_chains);
++    std::vector<std::vector<llama_token>> chains(n_chains);
+     int64_t maxK = 0;
+     int64_t sumK = 0;
+     for (int i = 0; i < n_chains; i++) {
+@@ -174,7 +174,7 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
+     const int64_t t0 = ggml_time_us();
+ 
+     // --- хвост префикса (+ идемпотентная переоценка при пустом хвосте) ---
+-    llama_tokens tail;
++    std::vector<llama_token> tail;
+     llama_pos    tail_pos;
+     if (m < L) {
+         tail.assign(prefix.begin() + m, prefix.end());
+@@ -188,9 +188,11 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
+         // хвост может быть длиннее n_batch — режем на чанки; logits=1 только на
+         // ПОСЛЕДНЕМ токене последнего чанка (p0), промежуточные чанки без output
+         size_t off = 0;
++        int  p0_idx = 0;                       // индекс токена p0 в ПОСЛЕДНЕМ чанке (для get_logits_ith)
+         while (off < tail.size()) {
+             const size_t cnt = std::min((size_t) v.p.n_batch, tail.size() - off);
+             const bool   last_chunk = (off + cnt == tail.size());
++            p0_idx = (int) cnt - 1;            // logits=1 ставим на последнем токене последнего чанка
+             llama_batch b = llama_batch_init((int) cnt, 0, 1);
+             for (size_t i = 0; i < cnt; i++) {
+                 const int k = b.n_tokens;
+@@ -205,7 +207,10 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
+             llama_batch_free(b);
+             off += cnt;
+         }
+-        const float * row = llama_get_logits_ith(v.ctx, 0); // единственный output хвоста
++        // ВАЖНО: llama_get_logits_ith(i) принимает ИНДЕКС ТОКЕНА В БАТЧЕ последнего
++        // llama_decode, output_ids транслирует в строку сам (замерено: row-семантика
++        // даёт ошибку 'batch.logits[0] != true').
++        const float * row = llama_get_logits_ith(v.ctx, p0_idx);
+         if (!row) { err = "no p0 logits"; return {}; }
+         bonus = argmax_row(row, v.n_vocab);
+         if (m < L) { v.cached.insert(v.cached.end(), tail.begin(), tail.end()); }
+@@ -223,9 +228,11 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
+     std::vector<std::vector<int32_t>> targ(n_chains);
+     if (sumK > 0) {
+         llama_batch b = llama_batch_init((int) sumK, 0, (int32_t) v.p.n_seq_max);
++        std::vector<int> chain_bidx; chain_bidx.reserve((size_t) sumK);
+         for (int i = 0; i < n_chains; i++) {
+             for (size_t k = 0; k < chains[i].size(); k++) {
+                 const int t = b.n_tokens;
++                chain_bidx.push_back(t);
+                 b.token[t]     = chains[i][k];
+                 b.pos[t]       = (llama_pos) (L + k);
+                 b.n_seq_id[t]  = 1;
+@@ -240,7 +247,7 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
+         for (int i = 0; i < n_chains; i++) {
+             targ[i].reserve(chains[i].size());
+             for (size_t k = 0; k < chains[i].size(); k++) {
+-                const float * rp = llama_get_logits_ith(v.ctx, row++);
++                const float * rp = llama_get_logits_ith(v.ctx, chain_bidx[row++]);
+                 if (!rp) { err = "missing chain logits row"; return {}; }
+                 targ[i].push_back(argmax_row(rp, v.n_vocab));
+             }
+@@ -344,7 +351,7 @@ int main(int argc, char ** argv) {
+ 
+     llama_model_params mp = llama_model_default_params();
+     mp.n_gpu_layers = pp.n_gpu;
+-    mp.use_mmap     = !pp.no_mmap;
++    mp.load_mode    = pp.no_mmap ? LLAMA_LOAD_MODE_NONE : LLAMA_LOAD_MODE_MMAP;
+     v.model = llama_model_load_from_file(pp.model_path.c_str(), mp);
+     if (!v.model) { fprintf(stderr, "failed to load model %s\n", pp.model_path.c_str()); return 2; }
+     v.vocab   = llama_model_get_vocab(v.model);
+@@ -356,7 +363,8 @@ int main(int argc, char ** argv) {
+     cp.n_threads  = pp.n_threads;
+     cp.n_batch    = (uint32_t) pp.n_batch;
+     cp.n_ubatch   = (uint32_t) pp.n_ubatch;
+-    cp.flash_attn = pp.flash_attn;
++    cp.n_outputs_max = (uint32_t) pp.n_batch; // батч цепочек: до n_batch output-строк за раунд
++    cp.flash_attn_type = pp.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+     v.ctx = llama_init_from_model(v.model, cp);
+     if (!v.ctx) { fprintf(stderr, "failed to init context\n"); llama_model_free(v.model); return 2; }
+     v.mem = llama_get_memory(v.ctx);
+@@ -368,10 +376,10 @@ int main(int argc, char ** argv) {
+     httplib::Server srv;
+     srv.set_payload_max_length((size_t) 256 * 1024 * 1024);
+ 
+-    srv.Get("/health", [&](httplib::Response & res) {
++    srv.Get("/health", [&](const httplib::Request & /*req*/, httplib::Response & res) {
+         res.set_content("{\"status\":\"ok\"}", "application/json");
+     });
+-    srv.Get("/props", [&](httplib::Response & res) {
++    srv.Get("/props", [&](const httplib::Request & /*req*/, httplib::Response & res) {
+         std::lock_guard<std::mutex> lock(v.mu);
+         json j;
+         j["model"]           = v.p.model_path;
+-- 
+2.39.5
+
