@@ -664,16 +664,22 @@ static void session_batch(verifier & v, std::vector<std::shared_ptr<Pending>> & 
         items.push_back(std::move(x));
     }
     if (items.empty()) return;
+    // Паддинг цепочек до K_max (D-015): equal_seqs-резка рекуррентной памяти делит
+    // смешанный батч на несколько ubatch (фикс ~86 мс на каждый); добиваем короткие
+    // цепочки последним реальным токеном — один ubatch, один фикс.
+    int64_t Kmax = 0;
+    for (auto & x : items) Kmax = std::max(Kmax, (int64_t) x.r->chain.size());
+    const int64_t sumKpad = Kmax * (int64_t) items.size();
     if (cells + 16 > (int64_t) llama_n_ctx(v.ctx)) {
         for (auto & x : items) x.r->pr.set_value({429, json{{"error", "kv cell budget exceeded"}, {"retry_after", 1}}});
         return;
     }
-    if (sumK > (int64_t) v.p.n_batch) {
+    if (sumKpad > (int64_t) v.p.n_batch) {
         for (auto & x : items) x.r->pr.set_value({429, json{{"error", "chain tokens over n_batch"}, {"retry_after", 1}}});
         return;
     }
-    // ветки несут собственные ячейки цепочки ПОВЕРХ ствола: бюджет = cells + sumK + 16
-    if (sumK + 16 > (int64_t) llama_n_ctx(v.ctx) - cells) {
+    // ветки несут собственные ячейки цепочки ПОВЕРХ ствола (с pad-строками): cells + sumKpad + 16
+    if (sumKpad + 16 > (int64_t) llama_n_ctx(v.ctx) - cells) {
         for (auto & x : items) x.r->pr.set_value({429, json{{"error", "kv cell budget exceeded (branches)"}, {"retry_after", 1}}});
         return;
     }
@@ -794,9 +800,9 @@ static void session_batch(verifier & v, std::vector<std::shared_ptr<Pending>> & 
     if (items.empty()) return;
     const int64_t t_delta = ggml_time_us();
 
-    // ---------- фаза 2: ветки + общий батч цепочек ----------
+    // ---------- фаза 2: ветки + общий батч цепочек (паддинг до K_max, D-015) ----------
     std::vector<int> tok2item;
-    llama_batch b2 = llama_batch_init((int) sumK, 0, 1);
+    llama_batch b2 = llama_batch_init((int) sumKpad, 0, 1);
     for (size_t ii = 0; ii < items.size(); ii++) {
         auto & x = items[ii];
         const int64_t L = (int64_t) x.r->prefix.size();
@@ -804,9 +810,10 @@ static void session_batch(verifier & v, std::vector<std::shared_ptr<Pending>> & 
         const llama_seq_id br = (llama_seq_id) (2 * x.s->slot + 2);
         llama_memory_seq_rm(v.mem, br, -1, -1);
         llama_memory_seq_cp(v.mem, tr, br, 0, (llama_pos) L); // мета-шаринг ствола (D-006)
-        for (size_t k = 0; k < x.r->chain.size(); k++) {
+        const llama_token pad_tok = x.r->chain.back();
+        for (int64_t k = 0; k < Kmax; k++) {
             const int t = b2.n_tokens;
-            b2.token[t] = x.r->chain[k];
+            b2.token[t] = (k < (int64_t) x.r->chain.size()) ? x.r->chain[(size_t) k] : pad_tok;
             b2.pos[t] = (llama_pos) (L + k);
             b2.n_seq_id[t] = 1; b2.seq_id[t][0] = br; b2.logits[t] = 1;
             b2.n_tokens++;
@@ -861,7 +868,7 @@ static void session_batch(verifier & v, std::vector<std::shared_ptr<Pending>> & 
     }
     v.batches++;
     v.sess_rounds += (uint64_t) items.size();
-    v.round_tokens += (uint64_t) sumK;
+    v.round_tokens += (uint64_t) sumKpad; // pad-строки — реальная работа декода
 }
 
 static void queue_worker(verifier & v) {
