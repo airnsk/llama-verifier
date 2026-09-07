@@ -265,6 +265,10 @@ static json round_verify(verifier & v, const json & req, std::string & err) {
     if (m == L && !(v.p0_len == L && v.p0_top >= 0)) {
         bool ok = llama_memory_seq_rm(v.mem, 0, (llama_pos) (L - 1), -1);
         if (ok) {
+            const llama_pos pmaxv = llama_memory_seq_pos_max(v.mem, 0);
+            if (pmaxv >= (llama_pos) (L - 1)) ok = false;
+        }
+        if (ok) {
             v.cached.resize(L - 1);
             m = L - 1;
         } else {
@@ -1326,35 +1330,51 @@ int main(int argc, char ** argv) {
         const unsigned vseed = body.value("seed", (unsigned) std::chrono::steady_clock::now().time_since_epoch().count());
         std::mt19937 rng(vseed);
         std::string err;
+        static std::vector<float> p0_cache_logits;
+        static int64_t p0_cache_len = -1;
+        bool reuse = (!p0_cache_logits.empty() && p0_cache_len == (int64_t) prefix.size()
+                      && (int64_t) v.cached.size() == (int64_t) prefix.size());
+        if (reuse) { for (size_t ci = 0; ci < prefix.size(); ci++) if (v.cached[ci] != prefix[ci]) { reuse = false; break; } }
+        if (!reuse) {
         int64_t m = 0;
         { const int64_t cmax = std::min((int64_t) v.cached.size(), (int64_t) prefix.size());
           while (m < cmax && v.cached[m] == prefix[m]) { m++; }
           if (m < (int64_t) v.cached.size()) {
-              if (llama_memory_seq_rm(v.mem, 0, (llama_pos) m, -1)) v.cached.resize(m);
-              else { llama_memory_seq_rm(v.mem, 0, -1, -1); v.cached.clear(); m = 0; } } }
+              if (llama_memory_seq_rm(v.mem, 0, (llama_pos) m, -1)) {
+                  const llama_pos pmax = llama_memory_seq_pos_max(v.mem, 0);
+                  if (pmax >= (llama_pos) m) { llama_memory_seq_rm(v.mem, 0, -1, -1); v.cached.clear(); m = 0; }
+                  else v.cached.resize(m);
+              } else { llama_memory_seq_rm(v.mem, 0, -1, -1); v.cached.clear(); m = 0; }
+              v.p0_invalidate(); } }
         const int64_t L = (int64_t) prefix.size();
         tokens_t tail;
-        if (m == L) { if (llama_memory_seq_rm(v.mem, 0, (llama_pos)(L-1), -1)) { v.cached.resize((size_t)(L-1)); m = L-1; }
-                      else { llama_memory_seq_rm(v.mem, 0, -1, -1); v.cached.clear(); m = 0; } }
+        if (m == L) {
+            if (llama_memory_seq_rm(v.mem, 0, (llama_pos) (L - 1), -1)) {
+                const llama_pos pmax2 = llama_memory_seq_pos_max(v.mem, 0);
+                if (pmax2 >= (llama_pos) (L - 1)) { llama_memory_seq_rm(v.mem, 0, -1, -1); v.cached.clear(); m = 0; }
+                else { v.cached.resize((size_t)(L - 1)); m = L - 1; }
+            } else { llama_memory_seq_rm(v.mem, 0, -1, -1); v.cached.clear(); m = 0; } }
         if (m < L) tail.assign(prefix.begin()+m, prefix.end());
         if (tail.empty()) { res.status = 409; res.set_content("{\"error\":\"empty tail\"}", "application/json"); return; }
         llama_batch b = llama_batch_init((int) tail.size(), 0, 1);
         for (size_t i = 0; i < tail.size(); i++) { const int k = b.n_tokens;
             b.token[k]=tail[i]; b.pos[k]=(llama_pos)(m+(llama_pos)i); b.n_seq_id[k]=1; b.seq_id[k][0]=0;
             b.logits[k]=(i+1==tail.size())?1:0; b.n_tokens++; }
-        if (!decode_full(v, b, err)) { llama_batch_free(b); res.status = 500; res.set_content(json{{"error","decode: "+err}}.dump(), "application/json"); return; }
+        if (!decode_full(v, b, err)) { llama_batch_free(b); res.status = 500; res.set_content(json{{"error", "decode: " + err}}.dump(), "application/json"); return; }
         llama_batch_free(b);
         v.cached.insert(v.cached.end(), tail.begin(), tail.end());
         const float * row = llama_get_logits_ith(v.ctx, (int) tail.size()-1);
         if (!row) { res.status = 500; res.set_content("{\"error\":\"no logits\"}", "application/json"); return; }
-        auto mkdist = [&](double T) { std::vector<double> w(v.n_vocab); double mx=-1e30;
-            for (int i=0;i<v.n_vocab;i++) mx=std::max(mx,(double)row[i]);
-            double s=0; for (int i=0;i<v.n_vocab;i++){ w[i]=std::exp(((double)row[i]-mx)/T); s+=w[i]; }
+        p0_cache_logits.assign(row, row + v.n_vocab); p0_cache_len = L;
+        }
+        auto mkdist = [&](const std::vector<float> & lg, double T) { std::vector<double> w(v.n_vocab); double mx=-1e30;
+            for (int i=0;i<v.n_vocab;i++) mx=std::max(mx,(double)lg[i]);
+            double s=0; for (int i=0;i<v.n_vocab;i++){ w[i]=std::exp(((double)lg[i]-mx)/T); s+=w[i]; }
             for (auto & x : w) x/=s; return w; };
-        const auto q = mkdist(ts);
+        const auto q = mkdist(p0_cache_logits, ts);
         std::discrete_distribution<int32_t> dq(q.begin(), q.end());
         const int32_t t = dq(rng);
-        const auto p = mkdist(tt);
+        const auto p = mkdist(p0_cache_logits, tt);
         std::uniform_real_distribution<double> ud(0.0,1.0);
         int32_t out_tok; int accepted;
         if (ud(rng) < std::min(1.0, p[t]/q[t])) { out_tok = t; accepted = 1; }
